@@ -68,6 +68,16 @@ Kalau server minta human check, muncul `[HUMAN_CHECK]`. Selesaikan Turnstile di 
 node longyu.js mine --turnstile <token>
 ```
 
+## Dashboard
+
+```bash
+node longyu.js dashboard    # akun + saldo + mining + task dalam satu layar
+node longyu.js demo         # pratinjau tampilan pakai data palsu
+```
+
+Isinya: `@handle` akun, alamat wallet, progress bar sesi mining (sisa waktu, rate, streak,
+hari ke-), progress task (selesai/total), dan tabel saldo (BNB BSC/L2, LONG, plus yang bisa diklaim).
+
 ## Saldo
 
 ```bash
@@ -124,6 +134,7 @@ node longyu.js check         # kirim bukti state L2 sekali
 |---|---|
 | `token` | cek bearer token + cara ambilnya |
 | `me` | profil akun |
+| `dashboard` | ringkasan akun + saldo + mining + task |
 | `status` | status mining |
 | `balance` | saldo BNB (BSC/L2) + token LONG |
 | `network` | info chain & token reward |
@@ -161,4 +172,7 @@ Diambil dari bundle `__common` aplikasi web (Expo/Metro), bukan tebakan.
 - Human check Cloudflare Turnstile tidak bisa diselesaikan dari Node — kirim tokennya manual.
 - Script hanya membaca data, menjalankan sesi mining/klaim, dan verifikasi task; tidak ada transfer dana.
 - Anti-bot: jeda acak antar request (`HUMAN_MIN_MS`/`HUMAN_MAX_MS`), retry backoff, dan jeda 1,5–3,2 s antar task.
+- RPC L1 punya daftar cadangan (`bsc-dataseed`, `llamarpc`): kalau satu kena rate limit, pindah otomatis.
+  `auto` membaca pesan "retry in N minutes" dan istirahat sesuai itu, bukan spam ulang.
+- Hasil `chain check` di-cache 45 detik / 3 menit per output index, jadi satu sesi tidak membanjiri RPC.
 - `stats` hari ini: 13.528 miner, `verificationOpen: false` (verifikasi identitas belum dibuka).

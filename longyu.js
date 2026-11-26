@@ -189,7 +189,8 @@ async function apiOnce(method, p, body, { auth = true, retried = false } = {}) {
   }
   const json = await res.json().catch(() => null);
 
-  if (res.status === 401 && auth && !retried && AUTH.refreshToken) {
+  const tokenError = res.status === 401 || /invalid_token|unauthorized/i.test(String(json?.error || json?.code || ''));
+  if (tokenError && auth && !retried && AUTH.refreshToken) {
     if (await refreshTokens()) return apiOnce(method, p, body, { auth, retried: true });
   }
   if (!res.ok) {
@@ -276,6 +277,43 @@ const ORACLE_ABI = [
   },
 ];
 
+/** Endpoint L1 cadangan — kalau satu kena rate limit, pindah ke berikutnya. */
+const L1_POOL = [
+  ENV.L1_RPC,
+  'https://bsc-dataseed.binance.org',
+  'https://bsc-dataseed1.defibit.io',
+  'https://bsc-dataseed1.ninicoin.io',
+  'https://binance.llamarpc.com',
+].filter((v, i, a) => v && a.indexOf(v) === i);
+
+class RateLimitError extends Error {
+  constructor(message, minutes) {
+    super(message);
+    this.code = 'RATE_LIMIT';
+    this.minutes = minutes;
+  }
+}
+
+/** "Rate limit exceeded, retry in 22 minutes" -> 22 */
+function parseRetryMinutes(msg) {
+  const m = /retry in\s+(\d+)\s*min/i.exec(String(msg || ''));
+  return m ? Number(m[1]) : 5;
+}
+
+async function rpcCallPool(pool, method, params = []) {
+  let lastErr;
+  for (const url of pool) {
+    try {
+      return await rpcCall(url, method, params);
+    } catch (e) {
+      lastErr = e;
+      if (/rate limit|too many requests|429/i.test(e.message)) continue;
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
 async function rpcCall(url, method, params = []) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), 15000);
@@ -287,7 +325,11 @@ async function rpcCall(url, method, params = []) {
       signal: ctrl.signal,
     });
     const json = await res.json();
-    if (json.error || json.result === undefined) throw new Error(json.error?.message || `${method} gagal`);
+    if (json.error || json.result === undefined) {
+      const msg = json.error?.message || `${method} gagal`;
+      if (/rate limit|too many requests/i.test(msg)) throw new RateLimitError(msg, parseRetryMinutes(msg));
+      throw new Error(msg);
+    }
     return json.result;
   } finally {
     clearTimeout(t);
@@ -295,15 +337,23 @@ async function rpcCall(url, method, params = []) {
 }
 
 /** Ambil bagian state L2 + bandingkan dengan output root di L1 (OutputOracle di BSC). */
-async function checkChain(index) {
+let chainCache = null; // { at, index, result }
+
+async function checkChain(index, { maxAgeMs = 45_000 } = {}) {
+  if (index === undefined && chainCache && Date.now() - chainCache.at < maxAgeMs) return chainCache.result;
+
   let idx = index;
   if (idx === undefined) {
     const data = encodeFunctionData({ abi: ORACLE_ABI, functionName: 'latestOutputIndex' });
-    const raw = await rpcCall(ENV.L1_RPC, 'eth_call', [{ to: ENV.OUTPUT_ORACLE, data }, 'latest']);
+    const raw = await rpcCallPool(L1_POOL, 'eth_call', [{ to: ENV.OUTPUT_ORACLE, data }, 'latest']);
     idx = BigInt(raw);
+    if (chainCache && chainCache.index === String(idx) && Date.now() - chainCache.at < 180_000) {
+      chainCache.at = Date.now();
+      return chainCache.result;
+    }
   }
   const data = encodeFunctionData({ abi: ORACLE_ABI, functionName: 'getL2Output', args: [idx] });
-  const rawOut = await rpcCall(ENV.L1_RPC, 'eth_call', [{ to: ENV.OUTPUT_ORACLE, data }, 'latest']);
+  const rawOut = await rpcCallPool(L1_POOL, 'eth_call', [{ to: ENV.OUTPUT_ORACLE, data }, 'latest']);
   const [out] = decodeAbiParameters(
     [{ type: 'tuple', components: [
       { type: 'bytes32', name: 'outputRoot' },
@@ -329,7 +379,14 @@ async function checkChain(index) {
   const root = keccak256(
     `0x${'00'.repeat(32)}${parts.stateRoot.slice(2)}${parts.messagePasserRoot.slice(2)}${parts.blockHash.slice(2)}`,
   );
-  return { index: String(idx), l2Block: String(out.l2BlockNumber), parts, match: root.toLowerCase() === out.outputRoot.toLowerCase() };
+  const result = {
+    index: String(idx),
+    l2Block: String(out.l2BlockNumber),
+    parts,
+    match: root.toLowerCase() === out.outputRoot.toLowerCase(),
+  };
+  chainCache = { at: Date.now(), index: String(idx), result };
+  return result;
 }
 
 // ─────────────────────────────── device attestation ───────────────────────────────
@@ -445,12 +502,21 @@ async function startMining({ autoAttest = true } = {}) {
 
 /** Kirim bukti state L2 secara berkala selama sesi aktif. */
 async function heartbeatLoop(stopAt, { once = false } = {}) {
+  let lastSentAt = 0;
   for (;;) {
     try {
       const chain = await checkChain();
       await post('/v1/mining/check', { index: chain.index, parts: chain.parts });
       console.log(`${dim(new Date().toISOString().slice(11, 19))} · check index ${chain.index} · ${chain.match ? green('match') : yellow('mismatch')}`);
+      lastSentAt = Date.now();
     } catch (e) {
+      if (e.code === 'RATE_LIMIT') {
+        const wait = Math.min(e.minutes || 5, 30);
+        warn(`RPC L1 kena rate limit · istirahat ${wait} menit lalu lanjut`);
+        if (once) return;
+        await sleep(wait * 60_000);
+        continue;
+      }
       warn(`check gagal: ${e.message}`);
     }
     if (once) return;
@@ -497,6 +563,69 @@ async function tokenBalance(rpc, address, owner) {
 function walletAddressOf(me) {
   const cand = me?.wallet?.address || me?.walletAddress || me?.wallet?.walletAddress || me?.address;
   return typeof cand === 'string' && /^0x[0-9a-fA-F]{40}$/.test(cand) ? cand : '';
+}
+
+// ─────────────────────────────── tampilan dashboard ───────────────────────────────
+function bar(pct, width = 24) {
+  const filled = Math.max(0, Math.min(width, Math.round((pct / 100) * width)));
+  return (NO_COLOR ? '#' : '\u001b[36m') + '█'.repeat(filled) + (NO_COLOR ? '-' : '\u001b[2m') + '░'.repeat(width - filled) + (NO_COLOR ? '' : '\u001b[0m');
+}
+
+function durationText(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '-';
+  const h = Math.floor(ms / 3.6e6);
+  const m = Math.floor((ms % 3.6e6) / 6e4);
+  return h ? `${h}j ${m}m` : `${m}m`;
+}
+
+function accountLine(me) {
+  const handle = me?.handle || me?.username || me?.xHandle;
+  const name = me?.name || me?.displayName;
+  const addr = walletAddressOf(me);
+  console.log(`${bold(handle ? '@' + handle : 'akun tanpa handle')}${name && name !== handle ? dim(' · ' + name) : ''}`);
+  console.log(`${dim('wallet ')} ${addr ? cyan(addr) : dim('belum ditautkan')}`);
+}
+
+function sessionBlock(st) {
+  const s = st?.session;
+  if (!s) {
+    const can = st?.canStart;
+    console.log(`${bold('MINING')} ${can ? green('siap dimulai') : dim('istirahat')}`);
+    return;
+  }
+  const start = Number(s.startedAt) * 1000;
+  const end = Number(s.endsAt) * 1000;
+  const now = Date.now();
+  const pct = end > start ? Math.min(100, Math.max(0, ((now - start) / (end - start)) * 100)) : 0;
+  console.log(`${bold('MINING')} ${green('aktif')} ${dim('· sisa ' + durationText(end - now))}`);
+  console.log(`${bar(pct)} ${pct.toFixed(0)}%`);
+  const extra = [];
+  if (st.estimatedPerHour !== undefined) extra.push(`${st.estimatedPerHour}/jam`);
+  if (st.power !== undefined) extra.push(`power ${st.power}`);
+  if (st.streakDays !== undefined) extra.push(`streak ${st.streakDays}h`);
+  if (st.day !== undefined) extra.push(`hari ${st.day}`);
+  if (extra.length) console.log(dim(extra.join(' · ')));
+}
+
+/** /v1/tasks -> {tasks:[{id,kind,url,done,opened,boostEndsAt}], eligible, boostBps, hours} */
+function tasksOf(data) {
+  const list = Array.isArray(data) ? data : data?.tasks || data?.items || [];
+  return { list, meta: Array.isArray(data) ? {} : data || {} };
+}
+
+const TASK_ICON = { follow: 'follow', like: 'like', repost: 'repost', reply: 'reply', share: 'share' };
+
+function renderTaskTable(list, meta = {}) {
+  if (!list.length) return console.log(dim('tidak ada task'));
+  const done = list.filter((t) => t.done).length;
+  const rows = list.map((t) => [
+    TASK_ICON[t.kind] || t.kind || 'task',
+    t.boostEndsAt && Number(t.boostEndsAt) * 1000 > Date.now() ? green('aktif') : '-',
+    t.done ? green('selesai') : t.opened ? yellow('sudah dibuka') : dim('belum'),
+  ]);
+  console.log(table(['TASK', 'BOOST', 'STATUS'], rows, ['l', 'l', 'l']));
+  console.log(`${dim('progress')} ${bar((done / list.length) * 100, 16)} ${done}/${list.length} task selesai`);
+  if (meta.eligible === false) warn('akun belum eligible untuk task (perlu mining aktif / verifikasi)');
 }
 
 // ─────────────────────────────── perintah ───────────────────────────────
@@ -628,42 +757,119 @@ ${bold('Cara ambil bearer token:')}
     if (process.argv.includes('--json')) console.log(JSON.stringify({ address: addr, me, mining: st }, null, 2));
   },
 
+  async dashboard() {
+    const [me, net, st, tasksData] = await Promise.all([
+      get('/v1/me'),
+      get('/v1/network').catch(() => null),
+      miningStatus().catch(() => null),
+      get('/v1/tasks').catch(() => null),
+    ]);
+
+    console.log('');
+    accountLine(me);
+    console.log('');
+    sessionBlock(st);
+
+    const { list, meta } = tasksOf(tasksData || {});
+    if (list.length) {
+      const done = list.filter((t) => t.done).length;
+      console.log(`${bold('TASK')} ${dim(`${done}/${list.length} selesai`)}`);
+    }
+
+    console.log('');
+    const rows = [];
+    const claimable = st?.claimable ?? st?.pending;
+    if (claimable !== undefined && claimable !== null) {
+      rows.push(['bisa diklaim', fmt(claimable) + ' ' + (net?.rewardToken?.symbol || 'LONG'), 'mining']);
+    }
+    const addr = walletAddressOf(me);
+    if (addr) {
+      const rewardAddr = net?.rewardToken?.address;
+      const reads = [
+        ['BNB (BSC)', rpcCall(ENV.L1_RPC, 'eth_getBalance', [addr, 'latest']).then((v) => fmt(BigInt(v)))],
+        ['BNB (LONGYU)', rpcCall(ENV.L2_RPC, 'eth_getBalance', [addr, 'latest']).then((v) => fmt(BigInt(v)))],
+      ];
+      if (rewardAddr) {
+        reads.push([net?.rewardToken?.symbol || 'LONG', tokenBalance(ENV.L2_RPC, rewardAddr, addr).then((v) => fmt(v))]);
+        reads.push([`${net?.rewardToken?.symbol || 'LONG'} (BSC)`, tokenBalance(ENV.L1_RPC, rewardAddr, addr).then((v) => fmt(v)).catch(() => '0')]);
+      }
+      for (const [label, promise] of reads) {
+        rows.push([label, (await promise.catch(() => null)) ?? dim('gagal'), 'wallet']);
+      }
+    } else {
+      warn('wallet belum ditautkan — buka menu Wallet di situs untuk membuat/menautkan');
+    }
+    if (rows.length) console.log(table(['SALDO', 'JUMLAH', 'SUMBER'], rows, ['l', 'r', 'l']));
+    console.log('');
+  },
+
+  async demo() {
+    const now = Math.floor(Date.now() / 1000);
+    const me = { handle: 'contoh', wallet: { address: '0x36b3e0796335F00eB630f5B7e654858FDFb19Bf8' } };
+    const st = { session: { startedAt: now - 3600, endsAt: now + 66000 }, estimatedPerHour: 12.5, power: 1, streakDays: 3, day: 4, claimable: '128421300000000000000' };
+    const list = [
+      { id: '1', kind: 'follow', done: true, boostEndsAt: now + 7200 },
+      { id: '2', kind: 'like', done: true },
+      { id: '3', kind: 'repost', done: false, opened: true },
+      { id: '4', kind: 'reply', done: false },
+    ];
+    console.log(dim('(demo — angka palsu, hanya pratinjau tampilan)'));
+    console.log('');
+    accountLine(me);
+    console.log('');
+    sessionBlock(st);
+    console.log('');
+    renderTaskTable(list, { eligible: true });
+    console.log('');
+    console.log(table(['SALDO', 'JUMLAH', 'SUMBER'], [
+      ['bisa diklaim', '128.4213 LONG', 'mining'],
+      ['BNB (BSC)', '0.0421', 'wallet'],
+      ['BNB (LONGYU)', '0.0100', 'wallet'],
+      ['LONG', '512.8834', 'wallet'],
+      ['LONG (BSC)', '0.0000', 'wallet'],
+    ], ['l', 'r', 'l']));
+    console.log('');
+  },
+
   async tasks() {
     const withParam = process.argv.includes('--reply') ? '?with=reply' : '';
     const data = await get(`/v1/tasks${withParam}`);
-    const list = Array.isArray(data) ? data : data.tasks || data.items || [];
+    const { list, meta } = tasksOf(data);
 
     if (!process.argv.includes('--auto')) {
-      render(data);
-      const todo = list.filter((t) => !t.done && !t.claimed && (t.status === undefined || t.status !== 'done'));
-      if (todo.length) console.log(dim(`\n${todo.length} task belum selesai — jalankan: node longyu.js tasks --auto`));
+      renderTaskTable(list, meta);
+      const todo = list.filter((t) => !t.done).length;
+      if (todo) console.log(dim(`\n${todo} task belum selesai — jalankan: node longyu.js tasks --auto`));
       return;
     }
 
-    // ── auto task ──
-    const todo = list.filter((t) => !t.done && !t.claimed && (t.status === undefined || t.status !== 'done'));
-    if (!todo.length) return ok('semua task sudah beres');
+    const todo = list.filter((t) => !t.done);
+    if (!todo.length) return ok('semua task sudah selesai');
 
     const rows = [];
     for (const t of todo) {
-      const label = t.kind || t.type || 'task';
+      const label = TASK_ICON[t.kind] || t.kind || 'task';
       try {
-        // jeda manusiawi + urutan sama seperti situs: open -> tunggu -> verify
         await sleep(rand(ENV.HUMAN_MIN_MS, ENV.HUMAN_MAX_MS));
         await api('POST', `/v1/tasks/${t.id}/open`).catch(() => null);
         if (t.url) console.log(`${dim('buka')} ${t.url}`);
         await sleep(rand(1500, 3200));
         await api('POST', `/v1/tasks/${t.id}/verify`);
-        rows.push([label, t.reward ?? '-', green('terverifikasi')]);
-        ok(`task ${label} selesai`);
+        rows.push([label, green('selesai')]);
+        ok(`task ${label} terverifikasi`);
       } catch (e) {
-        rows.push([label, t.reward ?? '-', red(e.code || e.message.slice(0, 30))]);
+        rows.push([label, red(e.code || e.message.slice(0, 28))]);
         warn(`task ${label} gagal: ${e.code || e.message}`);
       }
     }
-    console.log(table(['TASK', 'REWARD', 'STATUS'], rows, ['l', 'r', 'l']));
-    const fin = await miningStatus().catch(() => null);
-    if (fin) renderMining(fin);
+    console.log(table(['TASK', 'HASIL'], rows, ['l', 'l']));
+
+    const fresh = await get(`/v1/tasks${withParam}`).catch(() => null);
+    if (fresh) {
+      const after = tasksOf(fresh);
+      console.log('');
+      renderTaskTable(after.list, after.meta);
+    }
   },
 
   async start() {
@@ -708,29 +914,47 @@ ${bold('Cara ambil bearer token:')}
 
   async auto() {
     let round = 0;
+    let headerDone = false;
     console.log(dim(`mode auto · poll ${ENV.POLL_SECONDS}s · check ${ENV.CHAIN_CHECK_MS / 1000}s`));
+
     for (;;) {
       round += 1;
       try {
-        const st = await miningStatus();
+        const [me, st] = await Promise.all([get('/v1/me').catch(() => null), miningStatus()]);
+
+        if (!headerDone && me) {
+          console.log('');
+          accountLine(me);
+          console.log('');
+          headerDone = true;
+        }
+
         const claimable = st?.claimable ?? st?.pending;
         if (claimable !== undefined && claimable !== null && String(claimable) !== '0') {
           const res = await post('/v1/rewards/claim').catch((e) => ({ error: e.message }));
-          ok(`putaran ${round} · klaim ${res.claimId || res.error || 'ok'}`);
+          ok(`klaim ${res.claimId || res.error || 'ok'}`);
         }
+
         const endsAt = st?.session?.endsAt ? Number(st.session.endsAt) * 1000 : 0;
         if (endsAt && Date.now() < endsAt) {
-          console.log(`${dim(new Date().toISOString().slice(11, 19))} · sesi aktif, sisa ${Math.floor((endsAt - Date.now()) / 60000)}m`);
+          sessionBlock(st);
           await heartbeatLoop(endsAt, { once: true });
         } else if (st?.canStart) {
           console.log(`${dim(new Date().toISOString().slice(11, 19))} · mulai sesi baru`);
           const res = await startMining();
           const ends = res?.session?.endsAt ? Number(res.session.endsAt) * 1000 : 0;
-          if (ends) await heartbeatLoop(ends);
+          if (ends) await heartbeatLoop(ends, { once: true });
         } else {
           console.log(`${dim(new Date().toISOString().slice(11, 19))} · menunggu jadwal berikutnya`);
         }
+        console.log(dim('─'.repeat(46)));
       } catch (e) {
+        if (e.code === 'RATE_LIMIT') {
+          const wait = Math.min(e.minutes || 5, 30);
+          warn(`RPC kena rate limit · istirahat ${wait} menit`);
+          await sleep(wait * 60_000);
+          continue;
+        }
         warn(`putaran ${round}: ${e.code || ''} ${e.message}`);
       }
       if (ENV.MAX_ROUNDS && round >= ENV.MAX_ROUNDS) break;
@@ -783,6 +1007,8 @@ async function main() {
     console.log(`${bold('longyu.js')} ${dim('v' + VERSION)}`);
     console.log('');
     console.log(table(['PERINTAH', 'KETERANGAN'], [
+      ['dashboard', 'ringkasan: akun, saldo, mining, task'],
+      ['demo', 'pratinjau tampilan pakai data palsu'],
       ['token', 'cek bearer token + cara ambilnya'],
       ['me', 'profil akun'],
       ['status', 'status mining (sesi, rate, claimable)'],
@@ -812,7 +1038,10 @@ async function main() {
 
 main().catch((e) => {
   fail(e.code ? `[${e.code}] ${e.message}` : e.message);
-  if (e.status === 401) console.log(dim('  token kedaluwarsa → ambil ulang ACCESS_TOKEN dari localStorage longyu.tokens'));
+  if (e.status === 401 || /invalid_token|unauthorized/i.test(String(e.code || ''))) {
+    console.log(dim('  token kedaluwarsa → ambil ulang dari localStorage longyu.tokens'));
+    if (!AUTH.refreshToken) console.log(dim('  isi juga REFRESH_TOKEN supaya script bisa memperpanjang sesi sendiri'));
+  }
   if (process.env.DEBUG) console.error(e);
   process.exit(1);
 });
