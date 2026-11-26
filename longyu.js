@@ -51,6 +51,8 @@ const ENV = {
   NO_PACING: process.env.NO_PACING === '1',
   MAX_RETRY: Number(process.env.MAX_RETRY || 3),
   TURNSTILE: (process.env.TURNSTILE_TOKEN || '').trim(),
+  AUTO_TASKS: (process.env.AUTO_TASKS ?? '1') !== '0',
+  TASKS_INTERVAL_MIN: Number(process.env.TASKS_INTERVAL_MIN || 30),
   TOKENS_FILE: process.env.TOKENS_FILE || '.tokens.json',
 };
 
@@ -628,6 +630,40 @@ function renderTaskTable(list, meta = {}) {
   if (meta.eligible === false) warn('akun belum eligible untuk task (perlu mining aktif / verifikasi)');
 }
 
+/** Kerjakan semua task yang belum selesai. Dipakai `tasks --auto` dan loop `auto`. */
+async function runTasksAuto({ quiet = false } = {}) {
+  const data = await get('/v1/tasks');
+  const { list, meta } = tasksOf(data);
+  const todo = list.filter((t) => !t.done);
+  if (!todo.length) {
+    if (!quiet) ok('semua task sudah selesai');
+    return { done: 0, failed: 0, total: list.length };
+  }
+  if (meta.eligible === false) {
+    warn('akun belum eligible untuk task — dilewati');
+    return { done: 0, failed: 0, total: list.length, skipped: true };
+  }
+
+  let done = 0;
+  let failed = 0;
+  for (const t of todo) {
+    const label = TASK_ICON[t.kind] || t.kind || 'task';
+    try {
+      await sleep(rand(ENV.HUMAN_MIN_MS, ENV.HUMAN_MAX_MS));
+      await api('POST', `/v1/tasks/${t.id}/open`).catch(() => null);
+      if (t.url && !quiet) console.log(`${dim('buka')} ${t.url}`);
+      await sleep(rand(1500, 3200));
+      await api('POST', `/v1/tasks/${t.id}/verify`);
+      done += 1;
+      ok(`task ${label} terverifikasi`);
+    } catch (e) {
+      failed += 1;
+      warn(`task ${label} gagal: ${e.code || e.message.slice(0, 40)}`);
+    }
+  }
+  return { done, failed, total: list.length };
+}
+
 // ─────────────────────────────── perintah ───────────────────────────────
 const posArgs = () => process.argv.slice(2).filter((a) => !a.startsWith('-'));
 
@@ -843,33 +879,15 @@ ${bold('Cara ambil bearer token:')}
       return;
     }
 
-    const todo = list.filter((t) => !t.done);
-    if (!todo.length) return ok('semua task sudah selesai');
-
-    const rows = [];
-    for (const t of todo) {
-      const label = TASK_ICON[t.kind] || t.kind || 'task';
-      try {
-        await sleep(rand(ENV.HUMAN_MIN_MS, ENV.HUMAN_MAX_MS));
-        await api('POST', `/v1/tasks/${t.id}/open`).catch(() => null);
-        if (t.url) console.log(`${dim('buka')} ${t.url}`);
-        await sleep(rand(1500, 3200));
-        await api('POST', `/v1/tasks/${t.id}/verify`);
-        rows.push([label, green('selesai')]);
-        ok(`task ${label} terverifikasi`);
-      } catch (e) {
-        rows.push([label, red(e.code || e.message.slice(0, 28))]);
-        warn(`task ${label} gagal: ${e.code || e.message}`);
-      }
-    }
-    console.log(table(['TASK', 'HASIL'], rows, ['l', 'l']));
-
+    console.log('');
+    const res = await runTasksAuto();
     const fresh = await get(`/v1/tasks${withParam}`).catch(() => null);
     if (fresh) {
       const after = tasksOf(fresh);
       console.log('');
       renderTaskTable(after.list, after.meta);
     }
+    if (res.failed) warn(`${res.failed} task gagal — cek aksi aslinya di X (follow/like/repost/reply)`);
   },
 
   async start() {
@@ -915,7 +933,11 @@ ${bold('Cara ambil bearer token:')}
   async auto() {
     let round = 0;
     let headerDone = false;
-    console.log(dim(`mode auto · poll ${ENV.POLL_SECONDS}s · check ${ENV.CHAIN_CHECK_MS / 1000}s`));
+    let lastTasks = 0;
+    console.log(dim(
+      `mode auto · poll ${ENV.POLL_SECONDS}s · check ${ENV.CHAIN_CHECK_MS / 1000}s · ` +
+      `task ${ENV.AUTO_TASKS ? 'tiap ' + ENV.TASKS_INTERVAL_MIN + 'm' : 'nonaktif'}`,
+    ));
 
     for (;;) {
       round += 1;
@@ -933,6 +955,17 @@ ${bold('Cara ambil bearer token:')}
         if (claimable !== undefined && claimable !== null && String(claimable) !== '0') {
           const res = await post('/v1/rewards/claim').catch((e) => ({ error: e.message }));
           ok(`klaim ${res.claimId || res.error || 'ok'}`);
+        }
+
+        // task misi: sekali di awal, lalu tiap TASKS_INTERVAL_MIN
+        if (ENV.AUTO_TASKS && Date.now() - lastTasks > ENV.TASKS_INTERVAL_MIN * 60_000) {
+          lastTasks = Date.now();
+          const t = await runTasksAuto({ quiet: true }).catch((e) => {
+            warn(`task dilewati: ${e.code || e.message}`);
+            return null;
+          });
+          if (t && t.done) ok(`${t.done} task selesai${t.failed ? `, ${t.failed} gagal` : ''}`);
+          else if (t && t.failed) warn(`${t.failed} task gagal`);
         }
 
         const endsAt = st?.session?.endsAt ? Number(st.session.endsAt) * 1000 : 0;
