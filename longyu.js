@@ -587,6 +587,19 @@ function bar(pct, width = 24) {
   return (NO_COLOR ? '#' : '\u001b[36m') + '█'.repeat(filled) + (NO_COLOR ? '-' : '\u001b[2m') + '░'.repeat(width - filled) + (NO_COLOR ? '' : '\u001b[0m');
 }
 
+/** Apakah nilai saldo > 0? Menangani "0", 0, "0.0000", objek U128, dan e18 string. */
+function isPositive(v) {
+  if (v === null || v === undefined) return false;
+  if (typeof v === 'object') {
+    if ('hi' in v || 'lo' in v) return (BigInt(v.hi ?? 0) << 64n) + BigInt(v.lo ?? 0) > 0n;
+    return false;
+  }
+  const str = String(v).trim();
+  if (!/^\d+(\.\d+)?$/.test(str)) return false;
+  const [int, frac = ''] = str.split('.');
+  return Number(int) > 0 || /[1-9]/.test(frac); // "0.5" dihitung, "0.0000" tidak
+}
+
 /** Angka dari API kadang e18 (mis. "1020000000000000000") — rapikan untuk tampilan. */
 function fmtMaybeE18(v) {
   const str = String(v);
@@ -1001,7 +1014,7 @@ ${bold('Cara ambil bearer token:')}
     const wait = process.argv.includes('--wait');
     const st = await miningStatus().catch(() => null);
     const claimable = st?.claimable ?? st?.pending;
-    if (claimable !== undefined && claimable !== null && String(claimable) === '0') {
+    if (claimable !== undefined && claimable !== null && !isPositive(claimable)) {
       warn('belum ada yang bisa diklaim');
       renderClaims(await get('/v1/rewards').catch(() => null));
       return;
@@ -1077,9 +1090,11 @@ ${bold('Cara ambil bearer token:')}
         }
 
         const claimable = st?.claimable ?? st?.pending;
-        if (claimable !== undefined && claimable !== null && String(claimable) !== '0') {
+        if (isPositive(claimable)) {
+          console.log(`${dim('bisa diklaim ')} ${bold(fmt(claimable))} — memproses klaim`);
           const res = await post('/v1/rewards/claim').catch((e) => ({ error: e.message }));
-          ok(`klaim ${res.claimId || res.error || 'ok'}`);
+          if (res.claimId) ok(`klaim diterima · claimId ${res.claimId}`);
+          else warn(`klaim gagal: ${res.error || 'tanpa claimId'}`);
         }
 
         // task misi: sekali di awal, lalu tiap TASKS_INTERVAL_MIN
