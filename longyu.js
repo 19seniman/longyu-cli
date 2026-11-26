@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { keccak256, encodeFunctionData, decodeAbiParameters, numberToHex } from 'viem';
 
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const QUIET = process.argv.includes('--quiet') || process.argv.includes('-q');
 const NO_COLOR = !!process.env.NO_COLOR || !process.stdout.isTTY;
 const C = (code) => (s) => (NO_COLOR ? String(s) : `\u001b[${code}m${s}\u001b[0m`);
@@ -43,7 +43,7 @@ const ENV = {
   L2_RPC: process.env.L2_RPC || 'https://rpc.longyu.network',
   L1_RPC: process.env.L1_RPC || 'https://bsc-rpc.publicnode.com',
   OUTPUT_ORACLE: process.env.OUTPUT_ORACLE || '0x77fF9CDD8B92869D428956695dE0e2d94a75aDC8',
-  CHAIN_CHECK_MS: Number(process.env.CHAIN_CHECK_MS || 180_000),
+  CHAIN_CHECK_MS: Number(process.env.CHAIN_CHECK_MS || 300_000),
   POLL_SECONDS: Number(process.env.POLL_SECONDS || 60),
   MAX_ROUNDS: Number(process.env.MAX_ROUNDS || 0),
   HUMAN_MIN_MS: Number(process.env.HUMAN_MIN_MS || 700),
@@ -511,17 +511,26 @@ async function startMining({ autoAttest = true } = {}) {
 
 /** Kirim bukti state L2 secara berkala selama sesi aktif. */
 let checkCooldownUntil = 0;
+let lastCheckAt = 0; // dipakai auto: jangan kirim /v1/mining/check tiap putaran poll
+
+/** Jarak minimal antar check. Server Longyu membatasi request, jadi ada lantai aman. */
+function checkEveryMs() {
+  const floor = 120_000;
+  return Math.max(ENV.CHAIN_CHECK_MS, floor);
+}
 
 async function heartbeatLoop(stopAt, { once = false } = {}) {
   if (Date.now() < checkCooldownUntil) {
     const left = Math.ceil((checkCooldownUntil - Date.now()) / 60000);
     console.log(dim(`${new Date().toISOString().slice(11, 19)} · check ditunda ${left}m (cooldown server)`));
+    lastCheckAt = Date.now(); // jangan spam log tiap putaran poll
     return;
   }
   for (;;) {
     try {
       const chain = await checkChain();
       await post('/v1/mining/check', { index: chain.index, parts: chain.parts });
+      lastCheckAt = Date.now();
       console.log(`${dim(new Date().toISOString().slice(11, 19))} · check index ${chain.index} · ${chain.match ? green('match') : yellow('mismatch')}`);
     } catch (e) {
       if (e.code === 'RATE_LIMIT') {
@@ -573,16 +582,35 @@ async function tokenBalance(rpc, address, owner) {
 }
 
 /** Ambil alamat wallet dari objek /v1/me (beberapa bentuk). */
-function walletAddressOf(me) {
-  const cand = me?.wallet?.address || me?.walletAddress || me?.wallet?.walletAddress || me?.address;
-  if (typeof cand === 'string' && /^0x[0-9a-fA-F]{40}$/.test(cand)) return cand;
-  // cadangan: alamat dari .env (hanya untuk memantau saldo, bukan tujuan payout)
-  if (/^0x[0-9a-fA-F]{40}$/.test(ENV.WALLET_ADDRESS)) return ENV.WALLET_ADDRESS;
+const EVM_ADDR = /^0x[0-9a-fA-F]{40}$/;
+
+/**
+ * Cari alamat EVM di mana pun dalam payload /v1/me.
+ * Skema wallet situs bisa berubah (embedded wallet, custody, dst) — jangan bergantung satu field.
+ */
+function deepAddress(obj, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 4) return '';
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string' && EVM_ADDR.test(v) && /wallet|address/i.test(k)) return v;
+  }
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object') {
+      const hit = deepAddress(v, depth + 1);
+      if (hit) return hit;
+    }
+  }
   return '';
 }
 
-const walletFromEnv = (me) =>
-  !(me?.wallet?.address || me?.walletAddress || me?.address) && /^0x[0-9a-fA-F]{40}$/.test(ENV.WALLET_ADDRESS);
+function walletAddressOf(me) {
+  const own = deepAddress(me);
+  if (own) return own;
+  // cadangan: alamat dari .env (hanya untuk memantau saldo, bukan tujuan payout)
+  if (EVM_ADDR.test(ENV.WALLET_ADDRESS)) return ENV.WALLET_ADDRESS;
+  return '';
+}
+
+const walletFromEnv = (me) => !deepAddress(me) && EVM_ADDR.test(ENV.WALLET_ADDRESS);
 
 // ─────────────────────────────── tampilan dashboard ───────────────────────────────
 function bar(pct, width = 24) {
@@ -863,7 +891,9 @@ ${bold('Cara ambil bearer token:')}
   },
 
   async me() {
-    render(await get('/v1/me'));
+    const me = await get('/v1/me');
+    if (process.argv.includes('--json')) return console.log(JSON.stringify(me, null, 2));
+    render(me);
   },
 
   async status() {
@@ -1155,11 +1185,15 @@ ${bold('Cara ambil bearer token:')}
     let lastTasks = 0;
     const minTxt = ENV.MIN_CLAIM > 0 ? `${ENV.MIN_CLAIM} LONG` : 'tanpa batas';
     const everyTxt = ENV.CLAIM_EVERY_MIN > 0 ? `${ENV.CLAIM_EVERY_MIN}m` : 'tanpa jeda';
+    const checkEvery = checkEveryMs();
     console.log(dim(
-      `mode auto · poll ${ENV.POLL_SECONDS}s · check ${ENV.CHAIN_CHECK_MS / 1000}s · ` +
+      `mode auto · poll ${ENV.POLL_SECONDS}s · check ${checkEvery / 1000}s · ` +
       `task ${ENV.AUTO_TASKS ? 'tiap ' + ENV.TASKS_INTERVAL_MIN + 'm' : 'nonaktif'}`,
     ));
     console.log(dim(`klaim · min ${minTxt} · jeda ${everyTxt}`));
+    if (ENV.CHAIN_CHECK_MS < checkEvery) {
+      warn(`CHAIN_CHECK_MS ${ENV.CHAIN_CHECK_MS / 1000}s terlalu rapat — dipakai ${checkEvery / 1000}s (server membatasi request)`);
+    }
 
     for (;;) {
       round += 1;
@@ -1204,8 +1238,11 @@ ${bold('Cara ambil bearer token:')}
 
         const endsAt = st?.session?.endsAt ? Number(st.session.endsAt) * 1000 : 0;
         if (endsAt && Date.now() < endsAt) {
-          sessionBlock(st);
-          await heartbeatLoop(endsAt, { once: true });
+          // penting: poll 60s ≠ check 60s. Hormati CHAIN_CHECK_MS supaya server tidak rate limit.
+          if (Date.now() - lastCheckAt >= checkEvery) {
+            sessionBlock(st);
+            await heartbeatLoop(endsAt, { once: true });
+          }
         } else if (st?.canStart) {
           console.log(`${dim(new Date().toISOString().slice(11, 19))} · mulai sesi baru`);
           const res = await startMining();

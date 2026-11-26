@@ -7,7 +7,7 @@
 │  L O N G Y U   M I N E   companion           │
 │  project  Longyu · mine.longyu.network       │
 │  author   19Seniman                          │
-│  build    v1.1.0                             │
+│  build    v1.1.1                             │
 └──────────────────────────────────────────────┘
 ```
 
@@ -78,6 +78,10 @@ Alur yang dijalankan, sama seperti web-nya:
    lalu `keccak256(0x00×32 ‖ stateRoot ‖ messagePasserRoot ‖ blockHash)` dibandingkan dengan output root
 4. `POST /v1/mining/start` dengan `challengeId`, `work`, `captchaToken`
 5. Selama sesi: `POST /v1/mining/check {index, parts}` tiap `CHAIN_CHECK_MS`
+
+Poll 60 detik hanya untuk status dan klaim — **bukan** untuk `check`. Jarak antar `check`
+mengikuti `CHAIN_CHECK_MS` (default 5 menit, minimal 2 menit), supaya server tidak membalas
+`Rate limit exceeded`.
 
 Kalau server minta human check, muncul `[HUMAN_CHECK]`. Selesaikan Turnstile di browser lalu:
 
