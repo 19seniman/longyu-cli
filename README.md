@@ -1,7 +1,6 @@
 # longyu.js — CLI LONGYU MINE (mine.longyu.network)
 
-Login pakai **bearer token** dari browser (situs hanya menyediakan login X/Twitter OAuth), lalu
-jalankan sesi mining lengkap: attest device, proof-of-work, verifikasi output root L2, sampai klaim reward.
+# Register : https://mine.longyu.network/?invite=HJB6L2BL
 
 ```
 ┌──────────────────────────────────────────────┐
