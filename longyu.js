@@ -459,6 +459,46 @@ async function heartbeatLoop(stopAt, { once = false } = {}) {
   }
 }
 
+// ─────────────────────────────── saldo ───────────────────────────────
+const ERC20_ABI = [
+  { inputs: [], name: 'symbol', outputs: [{ type: 'string' }], stateMutability: 'view', type: 'function' },
+  { inputs: [], name: 'decimals', outputs: [{ type: 'uint8' }], stateMutability: 'view', type: 'function' },
+  { inputs: [{ type: 'address' }], name: 'balanceOf', outputs: [{ type: 'uint256' }], stateMutability: 'view', type: 'function' },
+];
+
+const fmt = (v, dec = 18, dp = 4) => {
+  const base = 10n ** BigInt(dec);
+  const n = BigInt(v ?? 0);
+  const i = n / base;
+  const f = (n % base).toString().padStart(dec, '0').slice(0, dp).replace(/0+$/, '');
+  return i.toLocaleString('en-US') + (f ? '.' + f : '');
+};
+
+async function tokenInfo(rpc, address) {
+  const [sym, dec] = await Promise.all([
+    rpcCall(rpc, 'eth_call', [{ to: address, data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'symbol' }) }, 'latest']),
+    rpcCall(rpc, 'eth_call', [{ to: address, data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'decimals' }) }, 'latest']),
+  ]);
+  return {
+    symbol: decodeAbiParameters([{ type: 'string' }], sym)[0],
+    decimals: Number(decodeAbiParameters([{ type: 'uint8' }], dec)[0]),
+  };
+}
+
+async function tokenBalance(rpc, address, owner) {
+  const raw = await rpcCall(rpc, 'eth_call', [
+    { to: address, data: encodeFunctionData({ abi: ERC20_ABI, functionName: 'balanceOf', args: [owner] }) },
+    'latest',
+  ]);
+  return decodeAbiParameters([{ type: 'uint256' }], raw)[0];
+}
+
+/** Ambil alamat wallet dari objek /v1/me (beberapa bentuk). */
+function walletAddressOf(me) {
+  const cand = me?.wallet?.address || me?.walletAddress || me?.wallet?.walletAddress || me?.address;
+  return typeof cand === 'string' && /^0x[0-9a-fA-F]{40}$/.test(cand) ? cand : '';
+}
+
 // ─────────────────────────────── perintah ───────────────────────────────
 const posArgs = () => process.argv.slice(2).filter((a) => !a.startsWith('-'));
 
@@ -536,6 +576,100 @@ ${bold('Cara ambil bearer token:')}
     ok('bukti terkirim ke server');
   },
 
+  async balance() {
+    const [me, net, st] = await Promise.all([
+      get('/v1/me'),
+      get('/v1/network').catch(() => null),
+      miningStatus().catch(() => null),
+    ]);
+    const addr = walletAddressOf(me);
+    const rewardAddr = net?.rewardToken?.address;
+
+    const rows = [];
+    const claimable = st?.claimable ?? st?.pending;
+    if (claimable !== undefined && claimable !== null) {
+      rows.push(['bisa diklaim', `${fmt(claimable)} ${net?.rewardToken?.symbol || 'LONG'}`, 'hasil mining']);
+    }
+    if (st?.rewards && typeof st.rewards === 'object') {
+      for (const [k, v] of Object.entries(st.rewards)) {
+        if (v !== null && typeof v !== 'object') rows.push([`mining ${k}`, fmt(v), 'akun']);
+      }
+    }
+
+    if (!addr) {
+      warn('wallet belum ditautkan ke akun — buat/link dulu di menu Wallet pada situs');
+      if (rows.length) console.log(table(['SALDO', 'JUMLAH', 'SUMBER'], rows, ['l', 'r', 'l']));
+      return;
+    }
+
+    console.log(`${dim('wallet ')} ${cyan(addr)}`);
+    const reads = [
+      ['BNB (BSC)', rpcCall(ENV.L1_RPC, 'eth_getBalance', [addr, 'latest']).then((v) => fmt(BigInt(v))), 'BSC'],
+      ['BNB (LONGYU)', rpcCall(ENV.L2_RPC, 'eth_getBalance', [addr, 'latest']).then((v) => fmt(BigInt(v))), 'L2'],
+    ];
+    if (rewardAddr) {
+      reads.push([
+        net?.rewardToken?.symbol || 'LONG',
+        tokenBalance(ENV.L2_RPC, rewardAddr, addr).then((v) => fmt(v)),
+        'L2',
+      ]);
+      reads.push([
+        `${net?.rewardToken?.symbol || 'LONG'} (BSC)`,
+        tokenBalance(ENV.L1_RPC, rewardAddr, addr).then((v) => fmt(v)).catch(() => '0'),
+        'BSC',
+      ]);
+    }
+
+    for (const [label, promise, chain] of reads) {
+      const value = await promise.catch(() => null);
+      rows.push([label, value === null ? dim('gagal dibaca') : value, chain]);
+    }
+    console.log(table(['SALDO', 'JUMLAH', 'CHAIN'], rows, ['l', 'r', 'l']));
+    if (process.argv.includes('--json')) console.log(JSON.stringify({ address: addr, me, mining: st }, null, 2));
+  },
+
+  async tasks() {
+    const withParam = process.argv.includes('--reply') ? '?with=reply' : '';
+    const data = await get(`/v1/tasks${withParam}`);
+    const list = Array.isArray(data) ? data : data.tasks || data.items || [];
+
+    if (!process.argv.includes('--auto')) {
+      render(data);
+      const todo = list.filter((t) => !t.done && !t.claimed && (t.status === undefined || t.status !== 'done'));
+      if (todo.length) console.log(dim(`\n${todo.length} task belum selesai — jalankan: node longyu.js tasks --auto`));
+      return;
+    }
+
+    // ── auto task ──
+    const todo = list.filter((t) => !t.done && !t.claimed && (t.status === undefined || t.status !== 'done'));
+    if (!todo.length) return ok('semua task sudah beres');
+
+    const rows = [];
+    for (const t of todo) {
+      const label = t.kind || t.type || 'task';
+      try {
+        // jeda manusiawi + urutan sama seperti situs: open -> tunggu -> verify
+        await sleep(rand(ENV.HUMAN_MIN_MS, ENV.HUMAN_MAX_MS));
+        await api('POST', `/v1/tasks/${t.id}/open`).catch(() => null);
+        if (t.url) console.log(`${dim('buka')} ${t.url}`);
+        await sleep(rand(1500, 3200));
+        await api('POST', `/v1/tasks/${t.id}/verify`);
+        rows.push([label, t.reward ?? '-', green('terverifikasi')]);
+        ok(`task ${label} selesai`);
+      } catch (e) {
+        rows.push([label, t.reward ?? '-', red(e.code || e.message.slice(0, 30))]);
+        warn(`task ${label} gagal: ${e.code || e.message}`);
+      }
+    }
+    console.log(table(['TASK', 'REWARD', 'STATUS'], rows, ['l', 'r', 'l']));
+    const fin = await miningStatus().catch(() => null);
+    if (fin) renderMining(fin);
+  },
+
+  async start() {
+    await cmds.mine();
+  },
+
   async claim() {
     const st = await miningStatus().catch(() => null);
     const claimable = st?.claimable ?? st?.pending;
@@ -554,11 +688,6 @@ ${bold('Cara ambil bearer token:')}
 
   async activity() {
     render(await get('/v1/activity'));
-  },
-
-  async tasks() {
-    const withParam = process.argv.includes('--reply') ? '?with=reply' : '';
-    render(await get(`/v1/tasks${withParam}`));
   },
 
   async invites() {
@@ -657,14 +786,17 @@ async function main() {
       ['token', 'cek bearer token + cara ambilnya'],
       ['me', 'profil akun'],
       ['status', 'status mining (sesi, rate, claimable)'],
+      ['balance', 'saldo wallet: BNB (BSC/L2) + token LONG'],
       ['network', 'info chain & token reward'],
       ['attest', 'attest device (wajib sebelum mining)'],
       ['mine [--follow]', 'mulai sesi mining (PoW + chain check)'],
+      ['start', 'alias dari mine'],
       ['check', 'kirim bukti state L2 sekarang'],
       ['claim', 'klaim reward'],
       ['rewards', 'riwayat reward'],
       ['activity', 'aktivitas akun'],
       ['tasks [--reply]', 'daftar task X'],
+      ['tasks --auto', 'kerjakan task otomatis (open -> verify)'],
       ['invites', 'kode & statistik invite'],
       ['boosts', 'paket boost'],
       ['leaderboard', 'papan peringkat'],

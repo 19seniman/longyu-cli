@@ -68,6 +68,34 @@ Kalau server minta human check, muncul `[HUMAN_CHECK]`. Selesaikan Turnstile di 
 node longyu.js mine --turnstile <token>
 ```
 
+## Saldo
+
+```bash
+node longyu.js balance          # BNB di BSC & LONGYU + token LONG
+node longyu.js balance --json   # sekalian dump data mentah
+```
+
+Yang dibaca: `BNB` di BSC, `BNB` di chain LONGYU, `LONG` di L2, `LONG` di BSC,
+plus angka `claimable` (hasil mining yang belum diklaim) dari `/v1/mining/status`.
+Semua dibaca langsung dari RPC, bukan dari API — jadi angkanya sama dengan dompet asli.
+
+Alamat wallet diambil dari `/v1/me`. Kalau belum ada wallet tertaut, script menyuruh
+membuat/menautkan dulu di menu Wallet pada situs.
+
+## Task otomatis
+
+```bash
+node longyu.js tasks            # lihat daftar + URL
+node longyu.js tasks --auto     # kerjakan otomatis
+node longyu.js tasks --auto --reply   # ikut task reply
+```
+
+Urutan per task sama seperti web-nya: `POST /v1/tasks/{id}/open` → jeda 1,5–3,2 detik →
+`POST /v1/tasks/{id}/verify`, lalu tabel hasil per task.
+
+Verifikasi dilakukan **server terhadap akun X kamu** — jadi aksi aslinya (follow/like/repost/reply)
+harus benar-benar ada. Script memicu dan memverifikasi, bukan memalsukan.
+
 ## Reward
 
 ```bash
@@ -97,13 +125,14 @@ node longyu.js check         # kirim bukti state L2 sekali
 | `token` | cek bearer token + cara ambilnya |
 | `me` | profil akun |
 | `status` | status mining |
+| `balance` | saldo BNB (BSC/L2) + token LONG |
 | `network` | info chain & token reward |
 | `attest` | attest device |
-| `mine [--follow]` | mulai sesi mining |
+| `mine [--follow]` / `start` | mulai sesi mining |
 | `check` | kirim bukti state L2 |
 | `claim` | klaim reward |
 | `rewards` / `activity` | riwayat |
-| `tasks [--reply]` | daftar task X |
+| `tasks [--reply] [--auto]` | daftar & kerjakan task X |
 | `invites` / `boosts` / `leaderboard` / `stats` | data lain |
 | `auto` | loop otomatis |
 | `debug` | tes API + chain + token |
@@ -130,5 +159,6 @@ Diambil dari bundle `__common` aplikasi web (Expo/Metro), bukan tebakan.
 - Login **tidak bisa** lewat private key: situs memakai X OAuth untuk akun, wallet hanya bisa di-*link*
   setelah masuk (`/v1/wallet/link` butuh sesi aktif).
 - Human check Cloudflare Turnstile tidak bisa diselesaikan dari Node — kirim tokennya manual.
-- Script hanya membaca data dan menjalankan sesi mining/klaim; tidak ada transfer dana.
+- Script hanya membaca data, menjalankan sesi mining/klaim, dan verifikasi task; tidak ada transfer dana.
+- Anti-bot: jeda acak antar request (`HUMAN_MIN_MS`/`HUMAN_MAX_MS`), retry backoff, dan jeda 1,5–3,2 s antar task.
 - `stats` hari ini: 13.528 miner, `verificationOpen: false` (verifikasi identitas belum dibuka).
