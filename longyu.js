@@ -664,6 +664,53 @@ async function runTasksAuto({ quiet = false } = {}) {
   return { done, failed, total: list.length };
 }
 
+// ─────────────────────────────── klaim ke wallet ───────────────────────────────
+/** /v1/rewards -> daftar klaim; bentuknya defensif karena skema belum terlihat. */
+function claimsOf(data) {
+  const list = data?.claims || data?.rewards || data?.items || (Array.isArray(data) ? data : []);
+  return Array.isArray(list) ? list : [];
+}
+
+const CLAIM_STATUS = { queued: yellow('antri'), sent: cyan('dikirim'), confirmed: green('masuk'), skipped: dim('dilewati'), failed: red('gagal') };
+
+function statusOf(c) {
+  const st = String(c.status || c.state || '').toLowerCase();
+  return CLAIM_STATUS[st] || st || '-';
+}
+
+function renderClaims(data) {
+  const list = claimsOf(data);
+  if (!list.length) return console.log(dim('belum ada riwayat klaim'));
+  const rows = list.slice(0, 15).map((c) => [
+    String(c.claimId || c.id || '-').slice(0, 12),
+    c.amount !== undefined ? fmt(c.amount) : c.amountE18 !== undefined ? fmt(c.amountE18) : '-',
+    statusOf(c),
+    (c.txHash || c.transactionHash || '-').slice(0, 14),
+    c.at || c.createdAt || c.date ? new Date(Number(c.at || c.createdAt) * 1000 || c.createdAt).toISOString().slice(0, 16).replace('T', ' ') : '-',
+  ]);
+  console.log(table(['CLAIM', 'JUMLAH', 'STATUS', 'TX', 'WAKTU'], rows, ['l', 'r', 'l', 'l', 'l']));
+}
+
+/** Tunggu klaim berubah status (queued -> sent -> confirmed), seperti situs. */
+async function waitClaim(claimId, { timeoutMs = 10 * 60_000, everyMs = 5000 } = {}) {
+  const t0 = Date.now();
+  let last = '';
+  while (Date.now() - t0 < timeoutMs) {
+    const data = await get('/v1/rewards').catch(() => null);
+    const list = claimsOf(data);
+    const mine = list.find((c) => String(c.claimId || c.id) === String(claimId)) || list[0];
+    const st = mine ? String(mine.status || mine.state || '').toLowerCase() : '';
+    if (st && st !== last) {
+      console.log(`${dim(new Date().toISOString().slice(11, 19))} · status ${CLAIM_STATUS[st] || st}`);
+      last = st;
+      if (['confirmed', 'sent', 'failed', 'skipped'].includes(st)) return { status: st, claim: mine };
+    }
+    if (!st) return { status: 'unknown', claim: mine };
+    await sleep(everyMs);
+  }
+  return { status: last || 'timeout', claim: null };
+}
+
 // ─────────────────────────────── perintah ───────────────────────────────
 const posArgs = () => process.argv.slice(2).filter((a) => !a.startsWith('-'));
 
@@ -794,11 +841,12 @@ ${bold('Cara ambil bearer token:')}
   },
 
   async dashboard() {
-    const [me, net, st, tasksData] = await Promise.all([
+    const [me, net, st, tasksData, rewards] = await Promise.all([
       get('/v1/me'),
       get('/v1/network').catch(() => null),
       miningStatus().catch(() => null),
       get('/v1/tasks').catch(() => null),
+      get('/v1/rewards').catch(() => null),
     ]);
 
     console.log('');
@@ -836,6 +884,16 @@ ${bold('Cara ambil bearer token:')}
       warn('wallet belum ditautkan — buka menu Wallet di situs untuk membuat/menautkan');
     }
     if (rows.length) console.log(table(['SALDO', 'JUMLAH', 'SUMBER'], rows, ['l', 'r', 'l']));
+
+    const claims = claimsOf(rewards);
+    if (claims.length) {
+      const last = claims[0];
+      console.log(
+        `${dim('klaim terakhir ')} ${statusOf(last)}` +
+        (last.amount !== undefined ? ` · ${fmt(last.amount)}` : '') +
+        (last.txHash ? dim(` · ${String(last.txHash).slice(0, 12)}…`) : ''),
+      );
+    }
     console.log('');
   },
 
@@ -864,6 +922,11 @@ ${bold('Cara ambil bearer token:')}
       ['LONG', '512.8834', 'wallet'],
       ['LONG (BSC)', '0.0000', 'wallet'],
     ], ['l', 'r', 'l']));
+    console.log('');
+    renderClaims({ claims: [
+      { claimId: 'clm_9f2a41', amount: '128421300000000000000', status: 'confirmed', txHash: '0x9ab12c44de77', at: now - 3600 },
+      { claimId: 'clm_7d10bb', amount: '64210000000000000000', status: 'sent', txHash: '0x31ff0a9b21c3', at: now - 120 },
+    ] });
     console.log('');
   },
 
@@ -895,19 +958,41 @@ ${bold('Cara ambil bearer token:')}
   },
 
   async claim() {
+    const wait = process.argv.includes('--wait');
     const st = await miningStatus().catch(() => null);
     const claimable = st?.claimable ?? st?.pending;
     if (claimable !== undefined && claimable !== null && String(claimable) === '0') {
       warn('belum ada yang bisa diklaim');
+      renderClaims(await get('/v1/rewards').catch(() => null));
+      return;
     }
+    if (claimable !== undefined && claimable !== null) {
+      console.log(`${dim('bisa diklaim ')} ${bold(fmt(claimable))}`);
+    }
+
     const res = await post('/v1/rewards/claim');
-    ok(`klaim diterima · claimId ${res.claimId || '-'}`);
-    const rw = await get('/v1/rewards').catch(() => null);
-    if (rw) render(rw, 'REWARDS');
+    const claimId = res.claimId || res.id || '-';
+    ok(`klaim diterima · claimId ${claimId}`);
+    if (res.claim) renderClaims({ claims: [res.claim] });
+
+    if (wait) {
+      console.log(dim('menunggu payout ke wallet…'));
+      const fin = await waitClaim(claimId);
+      if (fin.claim) renderClaims({ claims: [fin.claim] });
+      if (fin.status === 'confirmed') ok('reward sudah masuk wallet');
+      else if (fin.status === 'sent') ok('transaksi sudah dikirim ke wallet');
+      else warn(`status akhir: ${fin.status}`);
+    } else {
+      warn('payout diproses server — pakai `claim --wait` untuk memantau sampai masuk wallet');
+    }
+    renderClaims(await get('/v1/rewards').catch(() => null));
   },
 
   async rewards() {
-    render(await get('/v1/rewards'));
+    const data = await get('/v1/rewards');
+    const list = claimsOf(data);
+    if (list.length) return renderClaims(data);
+    render(data);
   },
 
   async activity() {
@@ -1051,7 +1136,7 @@ async function main() {
       ['mine [--follow]', 'mulai sesi mining (PoW + chain check)'],
       ['start', 'alias dari mine'],
       ['check', 'kirim bukti state L2 sekarang'],
-      ['claim', 'klaim reward'],
+      ['claim [--wait]', 'klaim reward ke wallet (+ pantau payout)'],
       ['rewards', 'riwayat reward'],
       ['activity', 'aktivitas akun'],
       ['tasks [--reply]', 'daftar task X'],

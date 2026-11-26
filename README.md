@@ -35,6 +35,14 @@ REFRESH_TOKEN=…
 
 Token disegarkan otomatis lewat `/v1/auth/refresh` dan disimpan ke `.tokens.json` (mode 600).
 
+## Klaim ke wallet
+
+```bash
+node longyu.js claim          # klaim sekarang
+node longyu.js claim --wait   # klaim + pantau payout sampai masuk wallet
+node longyu.js rewards        # riwayat klaim
+```
+
 ## Start Mining
 
 ```bash
