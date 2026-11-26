@@ -43,7 +43,7 @@ const ENV = {
   L2_RPC: process.env.L2_RPC || 'https://rpc.longyu.network',
   L1_RPC: process.env.L1_RPC || 'https://bsc-rpc.publicnode.com',
   OUTPUT_ORACLE: process.env.OUTPUT_ORACLE || '0x77fF9CDD8B92869D428956695dE0e2d94a75aDC8',
-  CHAIN_CHECK_MS: Number(process.env.CHAIN_CHECK_MS || 60_000),
+  CHAIN_CHECK_MS: Number(process.env.CHAIN_CHECK_MS || 180_000),
   POLL_SECONDS: Number(process.env.POLL_SECONDS || 60),
   MAX_ROUNDS: Number(process.env.MAX_ROUNDS || 0),
   HUMAN_MIN_MS: Number(process.env.HUMAN_MIN_MS || 700),
@@ -198,6 +198,9 @@ async function apiOnce(method, p, body, { auth = true, retried = false } = {}) {
   if (!res.ok) {
     const code = json?.error || json?.code || `HTTP_${res.status}`;
     const msg = json?.message || json?.error || `${res.status}`;
+    if (res.status === 429 || /rate limit|too many requests|retry in/i.test(`${code} ${msg}`)) {
+      throw new RateLimitError(msg, parseRetryMinutes(msg));
+    }
     throw new ApiError(msg, String(code).toUpperCase(), res.status, json);
   }
   return json ?? {};
@@ -211,8 +214,8 @@ async function api(method, p, body, opts = {}) {
       return await apiOnce(method, p, body, opts);
     } catch (e) {
       last = e;
-      const retryable = e.code === 'NETWORK' || e.status === 429 || e.status >= 500;
-      if (!retryable || i === maxAttempts) throw e;
+      const retryable = e.code === 'NETWORK' || (e.status >= 500 && e.status !== 429);
+      if (e.code === 'RATE_LIMIT' || !retryable || i === maxAttempts) throw e;
       const wait = Math.min(15000, 800 * 2 ** (i - 1)) + rand(0, 400);
       if (process.env.DEBUG) console.error(dim(`  retry ${i}/${maxAttempts - 1} · ${e.code || e.status} · ${wait}ms`));
       await sleep(wait);
@@ -437,7 +440,7 @@ function renderMining(st) {
     }
   }
   if (st.canStart !== undefined) rows.push(['bisa mulai', st.canStart ? green('ya') : dim('tidak')]);
-  if (st.estimatedPerHour !== undefined) rows.push(['estimasi/jam', String(st.estimatedPerHour)]);
+  if (st.estimatedPerHour !== undefined) rows.push(['estimasi/jam', fmtMaybeE18(st.estimatedPerHour)]);
   if (st.rate !== undefined) rows.push(['rate', String(st.rate)]);
   if (st.power !== undefined) rows.push(['power', String(st.power)]);
   if (st.streak !== undefined) rows.push(['streak', String(st.streak)]);
@@ -503,21 +506,25 @@ async function startMining({ autoAttest = true } = {}) {
 }
 
 /** Kirim bukti state L2 secara berkala selama sesi aktif. */
+let checkCooldownUntil = 0;
+
 async function heartbeatLoop(stopAt, { once = false } = {}) {
-  let lastSentAt = 0;
+  if (Date.now() < checkCooldownUntil) {
+    const left = Math.ceil((checkCooldownUntil - Date.now()) / 60000);
+    console.log(dim(`${new Date().toISOString().slice(11, 19)} · check ditunda ${left}m (cooldown server)`));
+    return;
+  }
   for (;;) {
     try {
       const chain = await checkChain();
       await post('/v1/mining/check', { index: chain.index, parts: chain.parts });
       console.log(`${dim(new Date().toISOString().slice(11, 19))} · check index ${chain.index} · ${chain.match ? green('match') : yellow('mismatch')}`);
-      lastSentAt = Date.now();
     } catch (e) {
       if (e.code === 'RATE_LIMIT') {
-        const wait = Math.min(e.minutes || 5, 30);
-        warn(`RPC L1 kena rate limit · istirahat ${wait} menit lalu lanjut`);
-        if (once) return;
-        await sleep(wait * 60_000);
-        continue;
+        const wait = Math.min(e.minutes || 5, 60);
+        checkCooldownUntil = Date.now() + wait * 60_000;
+        warn(`server membatasi request · check dijeda ${wait} menit (otomatis lanjut)`);
+        return;
       }
       warn(`check gagal: ${e.message}`);
     }
@@ -573,6 +580,13 @@ function bar(pct, width = 24) {
   return (NO_COLOR ? '#' : '\u001b[36m') + '█'.repeat(filled) + (NO_COLOR ? '-' : '\u001b[2m') + '░'.repeat(width - filled) + (NO_COLOR ? '' : '\u001b[0m');
 }
 
+/** Angka dari API kadang e18 (mis. "1020000000000000000") — rapikan untuk tampilan. */
+function fmtMaybeE18(v) {
+  const str = String(v);
+  if (/^\d{16,}$/.test(str)) return fmt(str);
+  return str;
+}
+
 function durationText(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return '-';
   const h = Math.floor(ms / 3.6e6);
@@ -602,7 +616,7 @@ function sessionBlock(st) {
   console.log(`${bold('MINING')} ${green('aktif')} ${dim('· sisa ' + durationText(end - now))}`);
   console.log(`${bar(pct)} ${pct.toFixed(0)}%`);
   const extra = [];
-  if (st.estimatedPerHour !== undefined) extra.push(`${st.estimatedPerHour}/jam`);
+  if (st.estimatedPerHour !== undefined) extra.push(`${fmtMaybeE18(st.estimatedPerHour)}/jam`);
   if (st.power !== undefined) extra.push(`power ${st.power}`);
   if (st.streakDays !== undefined) extra.push(`streak ${st.streakDays}h`);
   if (st.day !== undefined) extra.push(`hari ${st.day}`);
@@ -631,10 +645,21 @@ function renderTaskTable(list, meta = {}) {
 }
 
 /** Kerjakan semua task yang belum selesai. Dipakai `tasks --auto` dan loop `auto`. */
+const TASK_ERR = {
+  NOT_FOLLOWING: 'akun X belum follow target',
+  NOT_CONFIRMED: 'aksi belum terdeteksi di X (like/repost/reply belum ada)',
+  NOT_LIKED: 'belum like postingan target',
+  NOT_REPOSTED: 'belum repost',
+  NOT_REPLIED: 'belum reply',
+  TASK_NOT_DONE: 'aksi belum dilakukan',
+};
+
+const failedTasks = new Set();
+
 async function runTasksAuto({ quiet = false } = {}) {
   const data = await get('/v1/tasks');
   const { list, meta } = tasksOf(data);
-  const todo = list.filter((t) => !t.done);
+  const todo = list.filter((t) => !t.done && !failedTasks.has(t.id));
   if (!todo.length) {
     if (!quiet) ok('semua task sudah selesai');
     return { done: 0, failed: 0, total: list.length };
@@ -658,7 +683,8 @@ async function runTasksAuto({ quiet = false } = {}) {
       ok(`task ${label} terverifikasi`);
     } catch (e) {
       failed += 1;
-      warn(`task ${label} gagal: ${e.code || e.message.slice(0, 40)}`);
+      failedTasks.add(t.id);
+      warn(`task ${label} gagal: ${TASK_ERR[e.code] || e.code || e.message.slice(0, 40)}`);
     }
   }
   return { done, failed, total: list.length };
@@ -950,7 +976,10 @@ ${bold('Cara ambil bearer token:')}
       console.log('');
       renderTaskTable(after.list, after.meta);
     }
-    if (res.failed) warn(`${res.failed} task gagal — cek aksi aslinya di X (follow/like/repost/reply)`);
+    if (res.failed) {
+      warn(`${res.failed} task gagal — lakukan aksinya dulu di X, lalu jalankan lagi`);
+      console.log(dim('  task yang sudah gagal tidak diulang di sesi ini (auto)'));
+    }
   },
 
   async start() {
