@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { keccak256, encodeFunctionData, decodeAbiParameters, numberToHex } from 'viem';
 
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
 const QUIET = process.argv.includes('--quiet') || process.argv.includes('-q');
 const NO_COLOR = !!process.env.NO_COLOR || !process.stdout.isTTY;
 const C = (code) => (s) => (NO_COLOR ? String(s) : `\u001b[${code}m${s}\u001b[0m`);
@@ -54,7 +54,10 @@ const ENV = {
   WALLET_ADDRESS: (process.env.WALLET_ADDRESS || '').trim(),
   AUTO_TASKS: (process.env.AUTO_TASKS ?? '1') !== '0',
   TASKS_INTERVAL_MIN: Number(process.env.TASKS_INTERVAL_MIN || 30),
+  MIN_CLAIM: Number(process.env.MIN_CLAIM ?? 1),
+  CLAIM_EVERY_MIN: Number(process.env.CLAIM_EVERY_MIN ?? 360),
   TOKENS_FILE: process.env.TOKENS_FILE || '.tokens.json',
+  CLAIM_STATE_FILE: process.env.CLAIM_STATE_FILE || '.claim-state.json',
 };
 
 const UA =
@@ -607,6 +610,76 @@ function fmtMaybeE18(v) {
   return str;
 }
 
+/** Nilai apa pun dari API -> angka LONG (bukan wei). Aman untuk e18 string, desimal, dan U128. */
+function amountToNum(v) {
+  if (v === null || v === undefined) return 0;
+  if (typeof v === 'object') {
+    if ('hi' in v || 'lo' in v) return Number((BigInt(v.hi ?? 0) << 64n) + BigInt(v.lo ?? 0)) / 1e18;
+    return 0;
+  }
+  const str = String(v).trim();
+  if (!/^\d+(\.\d+)?$/.test(str)) return 0;
+  if (/^\d{16,}$/.test(str)) return Number(str) / 1e18; // e18 mentah
+  return Number(str);
+}
+
+/** Tampilkan nominal hasil mining dengan 4 desimal, apa pun bentuk mentahnya. */
+function fmtAmount(v) {
+  const str = String(v ?? 0).trim();
+  if (/^\d{16,}$/.test(str)) return fmt(str);
+  const n = amountToNum(v);
+  if (!Number.isFinite(n)) return str;
+  return n.toLocaleString('en-US', { maximumFractionDigits: 4 });
+}
+
+// ─────────────────────────── pengaman klaim (MIN_CLAIM / CLAIM_EVERY_MIN) ───────────────────────────
+const claimStatePath = path.isAbsolute(ENV.CLAIM_STATE_FILE)
+  ? ENV.CLAIM_STATE_FILE
+  : path.join(BASE_DIR, ENV.CLAIM_STATE_FILE);
+
+function loadClaimState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(claimStatePath, 'utf8'));
+    return { lastAt: Number(s.lastAt) || 0, lastAmount: String(s.lastAmount ?? ''), lastId: String(s.lastId ?? '') };
+  } catch {
+    return { lastAt: 0, lastAmount: '', lastId: '' };
+  }
+}
+function saveClaimState(patch) {
+  const next = { ...loadClaimState(), ...patch };
+  try {
+    fs.writeFileSync(claimStatePath, JSON.stringify(next, null, 2), { mode: 0o600 });
+  } catch {}
+  return next;
+}
+
+/**
+ * Boleh klaim sekarang? Kembalikan { ok, reason } supaya auto bisa menjelaskan
+ * kenapa menahan diri, bukan diam saja.
+ */
+function claimGate(claimable) {
+  const amount = amountToNum(claimable);
+  const st = loadClaimState();
+  const min = ENV.MIN_CLAIM;
+  const windowMs = ENV.CLAIM_EVERY_MIN * 60_000;
+
+  if (min > 0 && amount < min) {
+    return { ok: false, amount, reason: `nominal ${fmtAmount(claimable)} < min ${min}`, kind: 'AMOUNT' };
+  }
+  if (windowMs > 0 && st.lastAt && Date.now() - st.lastAt < windowMs) {
+    const left = windowMs - (Date.now() - st.lastAt);
+    return {
+      ok: false,
+      amount,
+      reason: `jeda klaim · sisa ${durationText(left)} dari ${ENV.CLAIM_EVERY_MIN}m`,
+      kind: 'INTERVAL',
+      lastAt: st.lastAt,
+    };
+  }
+  return { ok: true, amount, lastAt: st.lastAt };
+}
+
+
 function durationText(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return '-';
   const h = Math.floor(ms / 3.6e6);
@@ -850,7 +923,7 @@ ${bold('Cara ambil bearer token:')}
     const rows = [];
     const claimable = st?.claimable ?? st?.pending;
     if (claimable !== undefined && claimable !== null) {
-      rows.push(['bisa diklaim', `${fmt(claimable)} ${net?.rewardToken?.symbol || 'LONG'}`, 'hasil mining']);
+      rows.push(['bisa diklaim', `${fmtAmount(claimable)} ${net?.rewardToken?.symbol || 'LONG'}`, 'hasil mining']);
     }
     if (st?.rewards && typeof st.rewards === 'object') {
       for (const [k, v] of Object.entries(st.rewards)) {
@@ -914,7 +987,7 @@ ${bold('Cara ambil bearer token:')}
     const rows = [];
     const claimable = st?.claimable ?? st?.pending;
     if (claimable !== undefined && claimable !== null) {
-      rows.push(['bisa diklaim', fmt(claimable) + ' ' + (net?.rewardToken?.symbol || 'LONG'), 'mining']);
+      rows.push(['bisa diklaim', fmtAmount(claimable) + ' ' + (net?.rewardToken?.symbol || 'LONG'), 'mining']);
     }
     const addr = walletAddressOf(me);
     if (addr) {
@@ -1012,6 +1085,7 @@ ${bold('Cara ambil bearer token:')}
 
   async claim() {
     const wait = process.argv.includes('--wait');
+    const force = process.argv.includes('--force');
     const st = await miningStatus().catch(() => null);
     const claimable = st?.claimable ?? st?.pending;
     if (claimable !== undefined && claimable !== null && !isPositive(claimable)) {
@@ -1020,11 +1094,18 @@ ${bold('Cara ambil bearer token:')}
       return;
     }
     if (claimable !== undefined && claimable !== null) {
-      console.log(`${dim('bisa diklaim ')} ${bold(fmt(claimable))}`);
+      console.log(`${dim('bisa diklaim ')} ${bold(fmtAmount(claimable))} ${dim('LONG')}`);
+      // manual: jeda CLAIM_EVERY_MIN diabaikan (ini perintah eksplisit), tapi MIN_CLAIM tetap dijaga
+      const amount = amountToNum(claimable);
+      if (ENV.MIN_CLAIM > 0 && amount < ENV.MIN_CLAIM && !force) {
+        warn(`nominal ${fmtAmount(claimable)} di bawah MIN_CLAIM ${ENV.MIN_CLAIM} — tambahkan --force kalau tetap mau klaim`);
+        return;
+      }
     }
 
     const res = await post('/v1/rewards/claim');
     const claimId = res.claimId || res.id || '-';
+    if (res.claimId) saveClaimState({ lastAt: Date.now(), lastAmount: String(claimable ?? ''), lastId: String(res.claimId) });
     ok(`klaim diterima · claimId ${claimId}`);
     if (res.claim) renderClaims({ claims: [res.claim] });
 
@@ -1072,10 +1153,13 @@ ${bold('Cara ambil bearer token:')}
     let round = 0;
     let headerDone = false;
     let lastTasks = 0;
+    const minTxt = ENV.MIN_CLAIM > 0 ? `${ENV.MIN_CLAIM} LONG` : 'tanpa batas';
+    const everyTxt = ENV.CLAIM_EVERY_MIN > 0 ? `${ENV.CLAIM_EVERY_MIN}m` : 'tanpa jeda';
     console.log(dim(
       `mode auto · poll ${ENV.POLL_SECONDS}s · check ${ENV.CHAIN_CHECK_MS / 1000}s · ` +
       `task ${ENV.AUTO_TASKS ? 'tiap ' + ENV.TASKS_INTERVAL_MIN + 'm' : 'nonaktif'}`,
     ));
+    console.log(dim(`klaim · min ${minTxt} · jeda ${everyTxt}`));
 
     for (;;) {
       round += 1;
@@ -1091,10 +1175,20 @@ ${bold('Cara ambil bearer token:')}
 
         const claimable = st?.claimable ?? st?.pending;
         if (isPositive(claimable)) {
-          console.log(`${dim('bisa diklaim ')} ${bold(fmt(claimable))} — memproses klaim`);
-          const res = await post('/v1/rewards/claim').catch((e) => ({ error: e.message }));
-          if (res.claimId) ok(`klaim diterima · claimId ${res.claimId}`);
-          else warn(`klaim gagal: ${res.error || 'tanpa claimId'}`);
+          const gate = claimGate(claimable);
+          if (!gate.ok) {
+            const ts = new Date().toISOString().slice(11, 19);
+            console.log(dim(`${ts} · tahan klaim ${fmtAmount(claimable)} — ${gate.reason}`));
+          } else {
+            console.log(`${dim('bisa diklaim ')} ${bold(fmtAmount(claimable))} — memproses klaim`);
+            const res = await post('/v1/rewards/claim').catch((e) => ({ error: e.message }));
+            if (res.claimId) {
+              saveClaimState({ lastAt: Date.now(), lastAmount: String(claimable), lastId: String(res.claimId) });
+              ok(`klaim diterima · claimId ${res.claimId}`);
+            } else {
+              warn(`klaim gagal: ${res.error || 'tanpa claimId'}`);
+            }
+          }
         }
 
         // task misi: sekali di awal, lalu tiap TASKS_INTERVAL_MIN
@@ -1142,6 +1236,12 @@ ${bold('Cara ambil bearer token:')}
     console.log(`${dim('output oracle  ')} ${ENV.OUTPUT_ORACLE}`);
     console.log(`${dim('access token   ')} ${AUTH.accessToken ? dim('ada') : red('kosong')}`);
     console.log(`${dim('refresh token  ')} ${AUTH.refreshToken ? dim('ada') : dim('kosong')}`);
+    {
+      const cs = loadClaimState();
+      console.log(`${dim('min claim      ')} ${ENV.MIN_CLAIM > 0 ? ENV.MIN_CLAIM + ' LONG' : 'tanpa batas'}`);
+      console.log(`${dim('jeda klaim     ')} ${ENV.CLAIM_EVERY_MIN > 0 ? ENV.CLAIM_EVERY_MIN + ' menit' : 'tanpa jeda'}`);
+      console.log(`${dim('klaim terakhir ')} ${cs.lastAt ? new Date(cs.lastAt).toISOString().replace('T', ' ').slice(0, 19) + 'Z' : dim('belum ada')}`);
+    }
 
     try {
       const net = await get('/v1/network');
@@ -1191,7 +1291,8 @@ async function main() {
       ['mine [--follow]', 'mulai sesi mining (PoW + chain check)'],
       ['start', 'alias dari mine'],
       ['check', 'kirim bukti state L2 sekarang'],
-      ['claim [--wait]', 'klaim reward ke wallet (+ pantau payout)'],
+       ['claim [--wait]', 'klaim reward ke wallet (+ pantau payout)'],
+       ['claim --force', 'klaim walau di bawah MIN_CLAIM'],
       ['rewards', 'riwayat reward'],
       ['activity', 'aktivitas akun'],
       ['tasks [--reply]', 'daftar task X'],

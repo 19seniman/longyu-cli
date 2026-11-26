@@ -7,7 +7,7 @@
 │  L O N G Y U   M I N E   companion           │
 │  project  Longyu · mine.longyu.network       │
 │  author   19Seniman                          │
-│  build    v1.0.0                             │
+│  build    v1.1.0                             │
 └──────────────────────────────────────────────┘
 ```
 
@@ -39,8 +39,29 @@ Token disegarkan otomatis lewat `/v1/auth/refresh` dan disimpan ke `.tokens.json
 ```bash
 node longyu.js claim          # klaim sekarang
 node longyu.js claim --wait   # klaim + pantau payout sampai masuk wallet
+node longyu.js claim --force  # klaim walau di bawah MIN_CLAIM
 node longyu.js rewards        # riwayat klaim
 ```
+
+### Pengaman klaim
+
+`auto` tidak klaim tiap kali ada recehan. Dua penjaga di `.env`:
+
+```ini
+MIN_CLAIM=1            # klaim hanya kalau claimable >= 1 LONG
+CLAIM_EVERY_MIN=360    # jeda minimal 6 jam antar klaim
+```
+
+Selama belum lolos, layar menampilkan alasannya, misalnya:
+
+```
+12:04:11 · tahan klaim 0.42 — nominal 0.42 < min 1
+12:05:12 · tahan klaim 1.35 — jeda klaim · sisa 5j 12m dari 360m
+```
+
+Waktu klaim terakhir disimpan di `.claim-state.json`, jadi jeda tetap berlaku walau script
+di-restart. Perintah `claim` manual mengabaikan jeda (niat eksplisit), tapi tetap menghormati
+`MIN_CLAIM` kecuali pakai `--force`.
 
 ## Start Mining
 
