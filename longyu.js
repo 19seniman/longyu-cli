@@ -51,6 +51,7 @@ const ENV = {
   NO_PACING: process.env.NO_PACING === '1',
   MAX_RETRY: Number(process.env.MAX_RETRY || 3),
   TURNSTILE: (process.env.TURNSTILE_TOKEN || '').trim(),
+  WALLET_ADDRESS: (process.env.WALLET_ADDRESS || '').trim(),
   AUTO_TASKS: (process.env.AUTO_TASKS ?? '1') !== '0',
   TASKS_INTERVAL_MIN: Number(process.env.TASKS_INTERVAL_MIN || 30),
   TOKENS_FILE: process.env.TOKENS_FILE || '.tokens.json',
@@ -571,8 +572,14 @@ async function tokenBalance(rpc, address, owner) {
 /** Ambil alamat wallet dari objek /v1/me (beberapa bentuk). */
 function walletAddressOf(me) {
   const cand = me?.wallet?.address || me?.walletAddress || me?.wallet?.walletAddress || me?.address;
-  return typeof cand === 'string' && /^0x[0-9a-fA-F]{40}$/.test(cand) ? cand : '';
+  if (typeof cand === 'string' && /^0x[0-9a-fA-F]{40}$/.test(cand)) return cand;
+  // cadangan: alamat dari .env (hanya untuk memantau saldo, bukan tujuan payout)
+  if (/^0x[0-9a-fA-F]{40}$/.test(ENV.WALLET_ADDRESS)) return ENV.WALLET_ADDRESS;
+  return '';
 }
+
+const walletFromEnv = (me) =>
+  !(me?.wallet?.address || me?.walletAddress || me?.address) && /^0x[0-9a-fA-F]{40}$/.test(ENV.WALLET_ADDRESS);
 
 // ─────────────────────────────── tampilan dashboard ───────────────────────────────
 function bar(pct, width = 24) {
@@ -599,7 +606,11 @@ function accountLine(me) {
   const name = me?.name || me?.displayName;
   const addr = walletAddressOf(me);
   console.log(`${bold(handle ? '@' + handle : 'akun tanpa handle')}${name && name !== handle ? dim(' · ' + name) : ''}`);
-  console.log(`${dim('wallet ')} ${addr ? cyan(addr) : dim('belum ditautkan')}`);
+  const fromEnv = walletFromEnv(me);
+  console.log(
+    `${dim('wallet ')} ${addr ? cyan(addr) : dim('belum ditautkan')}` +
+    (addr && fromEnv ? dim(' (dari .env — pantau saja)') : ''),
+  );
 }
 
 function sessionBlock(st) {
@@ -840,7 +851,7 @@ ${bold('Cara ambil bearer token:')}
       return;
     }
 
-    console.log(`${dim('wallet ')} ${cyan(addr)}`);
+    console.log(`${dim('wallet ')} ${cyan(addr)}${walletFromEnv(me) ? dim(' (dari .env — pantau saja, bukan tujuan payout)') : ''}`);
     const reads = [
       ['BNB (BSC)', rpcCall(ENV.L1_RPC, 'eth_getBalance', [addr, 'latest']).then((v) => fmt(BigInt(v))), 'BSC'],
       ['BNB (LONGYU)', rpcCall(ENV.L2_RPC, 'eth_getBalance', [addr, 'latest']).then((v) => fmt(BigInt(v))), 'L2'],
