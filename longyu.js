@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { keccak256, encodeFunctionData, decodeAbiParameters, numberToHex } from 'viem';
 
-const VERSION = '1.1.1';
+const VERSION = '1.1.2';
 const QUIET = process.argv.includes('--quiet') || process.argv.includes('-q');
 const NO_COLOR = !!process.env.NO_COLOR || !process.stdout.isTTY;
 const C = (code) => (s) => (NO_COLOR ? String(s) : `\u001b[${code}m${s}\u001b[0m`);
@@ -472,14 +472,17 @@ async function startMining({ autoAttest = true } = {}) {
     throw e;
   }
 
-  let work;
+  // `work` di API bukan angka: bentuknya objek { counter, parts } (lihat bundle mine.js)
+  let counter;
+  let parts;
+
   if (ch.work && Number(ch.work.bits) > 0) {
     process.stdout.write(`${dim('PoW')} ${ch.work.bits} bit`);
-    work = await solvePuzzle(ch.nonce, Number(ch.work.bits), (i, ms) => {
+    counter = await solvePuzzle(ch.nonce, Number(ch.work.bits), (i, ms) => {
       if (!QUIET && process.stdout.isTTY) process.stdout.write(`\r${dim('PoW')} ${ch.work.bits} bit · ${i} hash · ${(i / (ms / 1000) / 1000).toFixed(0)}k/s   `);
     });
     if (!QUIET && process.stdout.isTTY) process.stdout.write('\n');
-    ok(`PoW selesai · counter ${work}`);
+    ok(`PoW selesai · counter ${counter}`);
   }
 
   if (ch.work?.output?.index !== undefined && ch.work?.output?.index !== null) {
@@ -487,11 +490,14 @@ async function startMining({ autoAttest = true } = {}) {
       warn(`chain check gagal: ${e.message}`);
       return null;
     });
-    if (chain && !chain.match) warn(`output root tidak cocok (index ${chain.index})`);
+    if (chain) {
+      parts = chain.parts;
+      if (!chain.match) warn(`output root tidak cocok (index ${chain.index})`);
+    }
   }
 
-  const body = { challengeId: ch.challengeId, work };
-  if (work === undefined) delete body.work;
+  const body = { challengeId: ch.challengeId };
+  if (ch.work) body.work = { counter, parts };
   if (ch.pulseRequired) {
     const t = turnstileToken();
     if (!t) {
@@ -504,7 +510,19 @@ async function startMining({ autoAttest = true } = {}) {
     body.captchaToken = t;
   }
 
-  const res = await post('/v1/mining/start', body);
+  let res;
+  try {
+    res = await post('/v1/mining/start', body);
+  } catch (e) {
+    if (e.code === 'INVALID_REQUEST' || e.code === 'invalid_request') {
+      const detail = e.body ? JSON.stringify(e.body) : '(tanpa detail)';
+      const hint = ch.pulseRequired
+        ? 'challenge minta human check — kirim --turnstile <token>'
+        : 'bentuk body: { challengeId, work:{counter,parts}, captchaToken?, attestationToken? }';
+      throw new ApiError(`start ditolak server · ${detail} · ${hint}`, 'INVALID_REQUEST', e.status, e.body);
+    }
+    throw e;
+  }
   ok('sesi mining dimulai');
   return res;
 }
@@ -1296,6 +1314,13 @@ ${bold('Cara ambil bearer token:')}
       try {
         const me = await get('/v1/me');
         ok(`auth OK · @${me.handle || me.username || '?'}`);
+        try {
+          const ch = await post('/v1/mining/challenge');
+          ok(`challenge OK · bits ${ch.work?.bits ?? 0} · humanCheck ${ch.pulseRequired ? red('minta turnstile') : 'tidak'} · output ${ch.work?.output?.index ?? '-'}`);
+          console.log(dim('  body start: { challengeId, work:{counter,parts}' + (ch.pulseRequired ? ', captchaToken' : '') + ' }'));
+        } catch (e) {
+          warn(`challenge gagal · ${e.code} ${e.message}`);
+        }
       } catch (e) {
         if (e.status === 401) warn('token tidak valid (401) — ambil ulang dari localStorage');
         else fail(`auth gagal · ${e.code} ${e.message}`);
