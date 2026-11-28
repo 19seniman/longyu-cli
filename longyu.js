@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { keccak256, encodeFunctionData, decodeAbiParameters, numberToHex } from 'viem';
 
-const VERSION = '1.1.3';
+const VERSION = '1.1.4';
 const QUIET = process.argv.includes('--quiet') || process.argv.includes('-q');
 const NO_COLOR = !!process.env.NO_COLOR || !process.stdout.isTTY;
 const C = (code) => (s) => (NO_COLOR ? String(s) : `\u001b[${code}m${s}\u001b[0m`);
@@ -748,6 +748,34 @@ function accountLine(me) {
 // ── saldo LONG (dibaca berkala, tidak tiap putaran) ──
 let BALANCE_CACHE = { at: 0, value: null, address: '', symbol: 'LONG', rewardAddr: '' };
 const BALANCE_TTL_MS = 10 * 60 * 1000;
+let REWARDS_CACHE = { at: 0, data: null };
+const REWARDS_TTL_MS = 5 * 60 * 1000;
+
+/** ambil /v1/rewards (dipakai untuk available / pending / claimed) */
+async function refreshRewards() {
+  if (Date.now() - REWARDS_CACHE.at < REWARDS_TTL_MS && REWARDS_CACHE.data) return REWARDS_CACHE.data;
+  const data = await get('/v1/rewards').catch(() => null);
+  REWARDS_CACHE = { at: Date.now(), data };
+  return data;
+}
+
+/** cari angka pertama yang cocok dari beberapa nama field (termasuk nested summary/totals) */
+function pickAmount(obj, names, depth = 0) {
+  if (!obj || typeof obj !== 'object' || depth > 3) return undefined;
+  for (const [k, v] of Object.entries(obj)) {
+    const key = k.toLowerCase();
+    if (names.some((n) => key === n || key === n + 'e18') && (typeof v === 'string' || typeof v === 'number')) {
+      return v;
+    }
+  }
+  for (const v of Object.values(obj)) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      const hit = pickAmount(v, names, depth + 1);
+      if (hit !== undefined) return hit;
+    }
+  }
+  return undefined;
+}
 
 async function refreshBalance(me) {
   const fresh = Date.now() - BALANCE_CACHE.at < BALANCE_TTL_MS && BALANCE_CACHE.value !== null;
@@ -767,6 +795,30 @@ async function refreshBalance(me) {
     BALANCE_CACHE.at = Date.now();
   }
   return BALANCE_CACHE;
+}
+
+/** tiga angka seperti di website: Available · Pending · Claimed */
+function bucketsLine(st, rewards) {
+  const avail = pickAmount(rewards, ['available', 'claimable']) ?? (st?.claimable ?? st?.pending);
+  const pend = pickAmount(rewards, ['pending', 'unclaimed']);
+  const claimed = pickAmount(rewards, ['claimed', 'totalclaimed', 'claimedtotal']);
+  const nextAt = pickAmount(rewards, ['nextclaimat', 'claimableat', 'availableat', 'unlockat']);
+
+  const cells = [
+    `${dim('Available')} ${bold(fmtAmount(avail ?? 0))}`,
+    `${dim('Pending  ')} ${bold(pend === undefined ? '-' : fmtAmount(pend))}`,
+    `${dim('Claimed  ')} ${bold(claimed === undefined ? '-' : fmtAmount(claimed))}`,
+  ];
+  console.log('  ' + cells.join(dim('  ·  ')));
+
+  if (nextAt) {
+    const ts = Number(nextAt);
+    const ms = ts > 1e12 ? ts : ts * 1000;
+    if (Number.isFinite(ms) && ms > Date.now()) {
+      const d = new Date(ms);
+      console.log('  ' + dim(`bisa diklaim ${d.toLocaleString('en-GB', { hour12: false }).replace(',', '')}`));
+    }
+  }
 }
 
 /** baris ringkas: saldo + yang bisa diklaim + jarak ke ambang */
@@ -1213,6 +1265,7 @@ ${bold('Cara ambil bearer token:')}
 
   async rewards() {
     const data = await get('/v1/rewards');
+    if (process.argv.includes('--json')) return console.log(JSON.stringify(data, null, 2));
     const list = claimsOf(data);
     if (list.length) return renderClaims(data);
     render(data);
@@ -1303,6 +1356,7 @@ ${bold('Cara ambil bearer token:')}
           // penting: poll 60s ≠ check 60s. Hormati CHAIN_CHECK_MS supaya server tidak rate limit.
           if (Date.now() - lastCheckAt >= checkEvery) {
             sessionBlock(st);
+            bucketsLine(st, await refreshRewards());
             claimBalanceLine(st);
             await heartbeatLoop(endsAt, { once: true });
           }
