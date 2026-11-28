@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { keccak256, encodeFunctionData, decodeAbiParameters, numberToHex } from 'viem';
 
-const VERSION = '1.1.2';
+const VERSION = '1.1.3';
 const QUIET = process.argv.includes('--quiet') || process.argv.includes('-q');
 const NO_COLOR = !!process.env.NO_COLOR || !process.stdout.isTTY;
 const C = (code) => (s) => (NO_COLOR ? String(s) : `\u001b[${code}m${s}\u001b[0m`);
@@ -745,6 +745,47 @@ function accountLine(me) {
   );
 }
 
+// ── saldo LONG (dibaca berkala, tidak tiap putaran) ──
+let BALANCE_CACHE = { at: 0, value: null, address: '', symbol: 'LONG', rewardAddr: '' };
+const BALANCE_TTL_MS = 10 * 60 * 1000;
+
+async function refreshBalance(me) {
+  const fresh = Date.now() - BALANCE_CACHE.at < BALANCE_TTL_MS && BALANCE_CACHE.value !== null;
+  if (fresh) return BALANCE_CACHE;
+
+  try {
+    const net = await get('/v1/network').catch(() => null);
+    const addr = walletAddressOf(me);
+    const rewardAddr = net?.rewardToken?.address || BALANCE_CACHE.rewardAddr;
+    const symbol = net?.rewardToken?.symbol || BALANCE_CACHE.symbol;
+    let value = null;
+    if (addr && rewardAddr) {
+      value = await tokenBalance(ENV.L2_RPC, rewardAddr, addr).catch(() => null);
+    }
+    BALANCE_CACHE = { at: Date.now(), value, address: addr, symbol, rewardAddr };
+  } catch {
+    BALANCE_CACHE.at = Date.now();
+  }
+  return BALANCE_CACHE;
+}
+
+/** baris ringkas: saldo + yang bisa diklaim + jarak ke ambang */
+function claimBalanceLine(st) {
+  const claimable = st?.claimable ?? st?.pending;
+  const bal = BALANCE_CACHE.value;
+  const sym = BALANCE_CACHE.symbol || 'LONG';
+  const parts = [];
+  parts.push(`${dim('saldo ')}${bal === null ? dim('?') : bold(fmt(bal))} ${sym}`);
+  if (claimable !== undefined && claimable !== null) {
+    const amount = amountToNum(claimable);
+    parts.push(`${dim('bisa diklaim ')}${bold(fmtAmount(claimable))} ${sym}`);
+    if (ENV.MIN_CLAIM > 0 && amount > 0 && amount < ENV.MIN_CLAIM) {
+      parts.push(dim(`(kurang ${(ENV.MIN_CLAIM - amount).toFixed(2)} dari min ${ENV.MIN_CLAIM})`));
+    }
+  }
+  console.log('  ' + parts.join(dim(' · ')));
+}
+
 function sessionBlock(st) {
   const s = st?.session;
   if (!s) {
@@ -1201,6 +1242,7 @@ ${bold('Cara ambil bearer token:')}
     let round = 0;
     let headerDone = false;
     let lastTasks = 0;
+    let meCache = null;
     const minTxt = ENV.MIN_CLAIM > 0 ? `${ENV.MIN_CLAIM} LONG` : 'tanpa batas';
     const everyTxt = ENV.CLAIM_EVERY_MIN > 0 ? `${ENV.CLAIM_EVERY_MIN}m` : 'tanpa jeda';
     const checkEvery = checkEveryMs();
@@ -1217,6 +1259,8 @@ ${bold('Cara ambil bearer token:')}
       round += 1;
       try {
         const [me, st] = await Promise.all([get('/v1/me').catch(() => null), miningStatus()]);
+        if (me) meCache = me;
+        await refreshBalance(meCache).catch(() => null);
 
         if (!headerDone && me) {
           console.log('');
@@ -1259,9 +1303,11 @@ ${bold('Cara ambil bearer token:')}
           // penting: poll 60s ≠ check 60s. Hormati CHAIN_CHECK_MS supaya server tidak rate limit.
           if (Date.now() - lastCheckAt >= checkEvery) {
             sessionBlock(st);
+            claimBalanceLine(st);
             await heartbeatLoop(endsAt, { once: true });
           }
         } else if (st?.canStart) {
+          claimBalanceLine(st);
           console.log(`${dim(new Date().toISOString().slice(11, 19))} · mulai sesi baru`);
           const res = await startMining();
           const ends = res?.session?.endsAt ? Number(res.session.endsAt) * 1000 : 0;
